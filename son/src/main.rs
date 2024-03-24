@@ -213,14 +213,19 @@ impl<'a> Parser<'a> {
 
         let start = this.son.new_start_node(&[Type::Control, Type::I32(I32Type::Bottom)][..]).peephole(this.son);
 
-        this.son.ctrl = this.son.new_proj_node(start, 0).peephole(this.son);
+        let entry = this.son.new_proj_node(start, 0).peephole(this.son);
+        this.son.set_ctrl(entry);
 
         this.locals.push(Scope {
             name: "arg",
-            value: this.son.new_proj_node(start, 1).peephole(this.son),
+            value: this.son.new_proj_node(start, 1).peephole(this.son).keep_alive(this.son),
         });
 
         this.parse_block(TokenKind::Eof);
+
+        this.son.clear_ctrl();
+        assert_eq!(this.locals.len(), 1);
+        this.locals[0].value.remove_keep_alive(this.son);
     }
 
     fn parse_block(&mut self, end: TokenKind) {
@@ -514,8 +519,9 @@ impl NodeId {
         }
     }
 
-    fn keep_alive(self, son: &mut Son) {
+    fn keep_alive(self, son: &mut Son) -> Self {
         self.add_out(NodeId::NONE, son);
+        self
     }
 
     fn remove_keep_alive(self, son: &mut Son) {
@@ -716,6 +722,15 @@ impl Son {
         assert_eq!(none, NodeId::NONE);
 
         return this;
+    }
+
+    fn set_ctrl(&mut self, ctrl: NodeId) {
+        self.ctrl = ctrl.keep_alive(self);
+    }
+
+    fn clear_ctrl(&mut self) {
+        core::mem::replace(&mut self.ctrl, NodeId::MAX)
+            .remove_keep_alive(self);
     }
 
     fn new_node(&mut self, kind: NodeKind, ty: Type, ins: &[NodeId]) -> NodeId {
