@@ -166,8 +166,14 @@ impl<'a> Parser<'a> {
             locals: Vec::new(),
         };
 
-        let start = this.son.new_start_node();
-        this.son.set_start(start);
+        let start = this.son.new_start_node(&[Type::Control, Type::I32(I32Type::Bottom)][..]).peephole(this.son);
+
+        this.son.ctrl = this.son.new_proj_node(start, 0).peephole(this.son);
+
+        this.locals.push(Scope {
+            name: "arg",
+            value: this.son.new_proj_node(start, 1).peephole(this.son),
+        });
 
         this.parse_block(TokenKind::Eof);
     }
@@ -206,7 +212,7 @@ impl<'a> Parser<'a> {
 
             TokenKind::KwReturn => {
                 let value = self.parse_expr(0);
-                self.son.new_return_node(self.son.start, value);
+                self.son.new_return_node(self.son.ctrl, value).peephole(self.son);
                 self.tok.expect(TokenKind::Semicolon);
             }
 
@@ -311,24 +317,78 @@ struct Node {
     outs: Vec<NodeId>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Type {
     Dead,
-    Bottom,
     Top,
-    I32(i32),
+    Bottom,
+    Control,
+    I32(I32Type),
+    Tuple(Vec<Type>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum I32Type {
+    Top,
+    Const(i32),
+    Bottom,
 }
 
 impl Type {
     #[inline]
-    fn is_dead(self) -> bool {
+    fn is_dead(&self) -> bool {
         matches!(self, Type::Dead)
+    }
+
+    fn is_constant(&self) -> bool {
+        match self {
+            Type::Dead => unreachable!(),
+            Type::Top => true,
+            Type::Bottom => false,
+            Type::Control => false,
+            Type::I32(t) => match t {
+                I32Type::Top => true,
+                I32Type::Const(_) => true,
+                I32Type::Bottom => false,
+            },
+            Type::Tuple(_) => false,
+        }
+    }
+
+    fn meet(&self, other: &Type) -> Type {
+        assert!(!self.is_dead());
+        assert!(!other.is_dead());
+
+        if self == other {
+            return self.clone();
+        }
+
+        match (self, other) {
+            (Type::I32(t1), Type::I32(t2)) => Type::I32(t1.meet(*t2)),
+
+            (Type::Tuple(_), Type::Tuple(_)) => todo!(),
+
+            _ => Type::Bottom
+        }
+    }
+}
+
+impl I32Type {
+    fn meet(self, other: Self) -> Self {
+        if self == other {
+            return self;
+        }
+        match (self, other) {
+            (I32Type::Top, t2) => t2,
+            (t1, I32Type::Top) => t1,
+            _ => I32Type::Bottom,
+        }
     }
 }
 
 impl From<i32> for Type {
     fn from(value: i32) -> Self {
-        Self::I32(value)
+        Self::I32(I32Type::Const(value))
     }
 }
 
@@ -337,23 +397,13 @@ enum NodeKind {
     Dead,
     Start,
     Return,
+    Proj(usize),
     Const,
     Neg,
     Add,
     Sub,
     Mul,
     Div,
-}
-
-impl Type {
-    fn is_constant(self) -> bool {
-        match self {
-            Type::Dead => unreachable!(),
-            Type::Bottom => false,
-            Type::Top => true,
-            Type::I32(_) => true,
-        }
-    }
 }
 
 impl NodeId {
@@ -363,8 +413,8 @@ impl NodeId {
     }
 
     #[inline]
-    fn ty(self, son: &Son) -> Type {
-        son.nodes[self].ty
+    fn ty(self, son: &Son) -> &Type {
+        &son.nodes[self].ty
     }
 
     #[inline]
@@ -479,59 +529,84 @@ impl NodeId {
         let ty = match this.kind {
             NodeKind::Dead => unreachable!(),
 
-            NodeKind::Start => Type::Bottom,
+            NodeKind::Start => this.ty.clone(),
 
-            NodeKind::Return => Type::Bottom,
+            NodeKind::Return => {
+                Type::Tuple(sti::vec![
+                    this.ins[0].ty(son).clone(),
+                    this.ins[1].ty(son).clone(),
+                ])
+            }
 
-            NodeKind::Const => this.ty,
+            NodeKind::Proj(index) => {
+                let Type::Tuple(tys) = this.ins[0].ty(son) else { unreachable!() };
+                tys[index].clone()
+            }
+
+            NodeKind::Const => this.ty.clone(),
 
             NodeKind::Neg => {
                 let arg = &son.nodes[this.ins[1]];
-                if let Type::I32(v) = arg.ty {
-                    Type::I32(-v)
+                if let Type::I32(t) = arg.ty {
+                    Type::I32(if let I32Type::Const(v) = t {
+                        I32Type::Const(-v)
+                    }
+                    else { t })
                 }
                 else { Type::Bottom }
             }
 
             NodeKind::Add => {
-                match (this.ins[1].ty(son), this.ins[2].ty(son)) {
+                match (this.ins[1].ty(son).clone(), this.ins[2].ty(son).clone()) {
                     (Type::I32(lhs), Type::I32(rhs)) =>
-                        Type::I32(lhs.wrapping_add(rhs)),
+                        Type::I32(if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
+                            I32Type::Const(lhs.wrapping_add(rhs))
+                        }
+                        else { lhs.meet(rhs) }),
 
                     _ => Type::Bottom
                 }
             }
 
             NodeKind::Sub => {
-                match (this.ins[1].ty(son), this.ins[2].ty(son)) {
+                match (this.ins[1].ty(son).clone(), this.ins[2].ty(son).clone()) {
                     (Type::I32(lhs), Type::I32(rhs)) =>
-                        Type::I32(lhs.wrapping_sub(rhs)),
+                        Type::I32(if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
+                            I32Type::Const(lhs.wrapping_sub(rhs))
+                        }
+                        else { lhs.meet(rhs) }),
 
                     _ => Type::Bottom
                 }
             },
 
             NodeKind::Mul => {
-                match (this.ins[1].ty(son), this.ins[2].ty(son)) {
+                match (this.ins[1].ty(son).clone(), this.ins[2].ty(son).clone()) {
                     (Type::I32(lhs), Type::I32(rhs)) =>
-                        Type::I32(lhs.wrapping_mul(rhs)),
+                        Type::I32(if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
+                            I32Type::Const(lhs.wrapping_mul(rhs))
+                        }
+                        else { lhs.meet(rhs) }),
 
                     _ => Type::Bottom
                 }
             },
 
             NodeKind::Div => {
-                match (this.ins[1].ty(son), this.ins[2].ty(son)) {
+                match (this.ins[1].ty(son).clone(), this.ins[2].ty(son).clone()) {
                     (Type::I32(lhs), Type::I32(rhs)) =>
-                        if rhs != 0 { Type::I32(lhs.wrapping_mul(rhs)) }
-                        else        { Type::Top },
+                        if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
+                            if rhs != 0 { Type::I32(I32Type::Const(lhs.wrapping_mul(rhs))) }
+                            else        { Type::Top }
+                        }
+                        else { Type::I32(lhs.meet(rhs)) },
 
                     _ => Type::Bottom
                 }
             }
         };
 
-        son.nodes[self].ty = ty;
+        son.nodes[self].ty = ty.clone();
         return ty;
     }
 
@@ -544,14 +619,14 @@ impl NodeId {
 
 struct Son {
     nodes: KVec<NodeId, Node>,
-    start: NodeId,
+    ctrl: NodeId
 }
 
 impl Son {
     fn new() -> Self {
         let mut this = Self {
             nodes: KVec::new(),
-            start: NodeId::MAX,
+            ctrl: NodeId::MAX,
         };
 
         let none = this.nodes.push(Node {
@@ -563,10 +638,6 @@ impl Son {
         assert_eq!(none, NodeId::NONE);
 
         return this;
-    }
-
-    fn set_start(&mut self, id: NodeId) {
-        self.start = id;
     }
 
     fn new_node(&mut self, kind: NodeKind, ty: Type, ins: &[NodeId]) -> NodeId {
@@ -588,36 +659,40 @@ impl Son {
         return id;
     }
 
-    fn new_start_node(&mut self) -> NodeId {
-        self.new_node(NodeKind::Start, Type::Bottom, &[])
+    fn new_start_node(&mut self, types: impl Into<Vec<Type>>) -> NodeId {
+        self.new_node(NodeKind::Start, Type::Tuple(types.into()), &[])
     }
 
     fn new_return_node(&mut self, ctrl: NodeId, value: NodeId) -> NodeId {
         self.new_node(NodeKind::Return, Type::Bottom, &[ctrl, value])
     }
 
+    fn new_proj_node(&mut self, node: NodeId, index: usize) -> NodeId {
+        self.new_node(NodeKind::Proj(index), Type::Bottom, &[node])
+    }
+
     fn new_const_node(&mut self, value: impl Into<Type>) -> NodeId {
-        self.new_node(NodeKind::Const, value.into(), &[self.start])
+        self.new_node(NodeKind::Const, value.into(), &[self.ctrl])
     }
 
     fn new_neg_node(&mut self, value: NodeId) -> NodeId {
-        self.new_node(NodeKind::Neg, Type::Bottom, &[self.start, value])
+        self.new_node(NodeKind::Neg, Type::Bottom, &[self.ctrl, value])
     }
 
     fn new_add_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Add, Type::Bottom, &[self.start, lhs, rhs])
+        self.new_node(NodeKind::Add, Type::Bottom, &[self.ctrl, lhs, rhs])
     }
 
     fn new_sub_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Sub, Type::Bottom, &[self.start, lhs, rhs])
+        self.new_node(NodeKind::Sub, Type::Bottom, &[self.ctrl, lhs, rhs])
     }
 
     fn new_mul_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Mul, Type::Bottom, &[self.start, lhs, rhs])
+        self.new_node(NodeKind::Mul, Type::Bottom, &[self.ctrl, lhs, rhs])
     }
 
     fn new_div_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Div, Type::Bottom, &[self.start, lhs, rhs])
+        self.new_node(NodeKind::Div, Type::Bottom, &[self.ctrl, lhs, rhs])
     }
 }
 
@@ -655,6 +730,18 @@ fn main() {
         var x1=3;
         var y1=4;
         return (x0-x1)*(x0-x1) + (y0-y1)*(y0-y1);
+    "#);
+    dbg!(&son.nodes);
+
+    let mut son = Son::new();
+    Parser::parse_file(&mut son, br#"
+        return 1 + arg + 2;
+    "#);
+    dbg!(&son.nodes);
+
+    let mut son = Son::new();
+    Parser::parse_file(&mut son, br#"
+        return arg + (1 + 2);
     "#);
     dbg!(&son.nodes);
 }
