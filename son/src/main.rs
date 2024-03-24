@@ -23,6 +23,13 @@ enum TokenKind<'a> {
     Mul,
     Div,
     Eq,
+    CmpEq,
+    CmpNe,
+    CmpLe,
+    CmpLt,
+    CmpGe,
+    CmpGt,
+    Not,
     LParen,
     RParen,
     LCurly,
@@ -34,6 +41,12 @@ enum TokenKind<'a> {
 impl<'a> TokenKind<'a> {
     fn prec_left(self) -> Option<u32> {
         Some(match self {
+            TokenKind::CmpEq => 400,
+            TokenKind::CmpNe => 400,
+            TokenKind::CmpLe => 400,
+            TokenKind::CmpLt => 400,
+            TokenKind::CmpGe => 400,
+            TokenKind::CmpGt => 400,
             TokenKind::Add => 600,
             TokenKind::Sub => 600,
             TokenKind::Mul => 800,
@@ -44,6 +57,12 @@ impl<'a> TokenKind<'a> {
 
     fn prec_right(self) -> u32 {
         match self {
+            TokenKind::CmpEq => 401,
+            TokenKind::CmpNe => 401,
+            TokenKind::CmpLe => 401,
+            TokenKind::CmpLt => 401,
+            TokenKind::CmpGe => 401,
+            TokenKind::CmpGt => 401,
             TokenKind::Add => 601,
             TokenKind::Sub => 601,
             TokenKind::Mul => 801,
@@ -99,7 +118,33 @@ impl<'a> Tokenizer<'a> {
             b'*' => TokenKind::Mul,
             b'/' => TokenKind::Div,
 
-            b'=' => TokenKind::Eq,
+            b'=' => {
+                if self.reader.consume_if_eq(&b'=') {
+                    TokenKind::CmpEq
+                }
+                else { TokenKind::Eq }
+            }
+
+            b'!' => {
+                if self.reader.consume_if_eq(&b'=') {
+                    TokenKind::CmpNe
+                }
+                else { TokenKind::Not }
+            }
+
+            b'<' => {
+                if self.reader.consume_if_eq(&b'=') {
+                    TokenKind::CmpLe
+                }
+                else { TokenKind::CmpLt }
+            }
+
+            b'>' => {
+                if self.reader.consume_if_eq(&b'=') {
+                    TokenKind::CmpGe
+                }
+                else { TokenKind::CmpGt }
+            }
 
             b'(' => TokenKind::LParen,
             b')' => TokenKind::RParen,
@@ -249,6 +294,12 @@ impl<'a> Parser<'a> {
             let rhs = self.parse_expr(at.kind.prec_right());
 
             result = match at.kind {
+                TokenKind::CmpEq => self.son.new_cmp_eq_node(result, rhs),
+                TokenKind::CmpNe => { let eq = self.son.new_cmp_eq_node(result, rhs).peephole(self.son); self.son.new_not_node(eq) },
+                TokenKind::CmpLe => self.son.new_cmp_le_node(result, rhs),
+                TokenKind::CmpLt => self.son.new_cmp_lt_node(result, rhs),
+                TokenKind::CmpGe => { let lt = self.son.new_cmp_lt_node(result, rhs).peephole(self.son); self.son.new_not_node(lt) },
+                TokenKind::CmpGt => { let le = self.son.new_cmp_le_node(result, rhs).peephole(self.son); self.son.new_not_node(le) },
                 TokenKind::Add => self.son.new_add_node(result, rhs),
                 TokenKind::Sub => self.son.new_sub_node(result, rhs),
                 TokenKind::Mul => self.son.new_mul_node(result, rhs),
@@ -268,6 +319,11 @@ impl<'a> Parser<'a> {
             TokenKind::Sub => {
                 let v = self.parse_expr(PREC_PREFIX);
                 self.son.new_neg_node(v).peephole(self.son)
+            }
+
+            TokenKind::Not => {
+                let v = self.parse_expr(PREC_PREFIX);
+                self.son.new_not_node(v).peephole(self.son)
             }
 
             TokenKind::Ident(name) => {
@@ -355,6 +411,14 @@ impl Type {
         }
     }
 
+    fn as_i32(&self) -> I32Type {
+        match self {
+            Type::Top => I32Type::Top,
+            Type::I32(t) => *t,
+            _ => unreachable!()
+        }
+    }
+
     fn meet(&self, other: &Type) -> Type {
         assert!(!self.is_dead());
         assert!(!other.is_dead());
@@ -400,6 +464,10 @@ enum NodeKind {
     Proj(usize),
     Const,
     Neg,
+    Not,
+    CmpEq,
+    CmpLe,
+    CmpLt,
     Add,
     Sub,
     Mul,
@@ -545,64 +613,74 @@ impl NodeId {
 
             NodeKind::Const => this.ty.clone(),
 
-            NodeKind::Neg => {
-                let arg = &son.nodes[this.ins[1]];
-                if let Type::I32(t) = arg.ty {
-                    Type::I32(if let I32Type::Const(v) = t {
-                        I32Type::Const(-v)
-                    }
-                    else { t })
+            NodeKind::Neg => Type::I32({
+                let ty = this.ins[1].ty(son).as_i32();
+                if let I32Type::Const(v) = ty {
+                    I32Type::Const(v.wrapping_neg())
                 }
-                else { Type::Bottom }
-            }
+                else { ty }
+            }),
 
-            NodeKind::Add => {
-                match (this.ins[1].ty(son).clone(), this.ins[2].ty(son).clone()) {
-                    (Type::I32(lhs), Type::I32(rhs)) =>
-                        Type::I32(if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
-                            I32Type::Const(lhs.wrapping_add(rhs))
-                        }
-                        else { lhs.meet(rhs) }),
-
-                    _ => Type::Bottom
+            NodeKind::Not => Type::I32({
+                let ty = this.ins[1].ty(son).as_i32();
+                if let I32Type::Const(v) = ty {
+                    I32Type::Const(if v == 0 { 1 } else { 0 })
                 }
-            }
+                else { ty }
+            }),
 
-            NodeKind::Sub => {
-                match (this.ins[1].ty(son).clone(), this.ins[2].ty(son).clone()) {
-                    (Type::I32(lhs), Type::I32(rhs)) =>
-                        Type::I32(if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
-                            I32Type::Const(lhs.wrapping_sub(rhs))
-                        }
-                        else { lhs.meet(rhs) }),
-
-                    _ => Type::Bottom
+            NodeKind::CmpEq |
+            NodeKind::CmpLe |
+            NodeKind::CmpLt => Type::I32({
+                let lhs = this.ins[1].ty(son).as_i32();
+                let rhs = this.ins[2].ty(son).as_i32();
+                if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
+                    let value = match this.kind {
+                        NodeKind::CmpEq => lhs == rhs,
+                        NodeKind::CmpLe => lhs <= rhs,
+                        NodeKind::CmpLt => lhs <  rhs,
+                        _ => unreachable!()
+                    };
+                    I32Type::Const(value as i32)
                 }
-            },
+                else { lhs.meet(rhs) }
+            }),
 
-            NodeKind::Mul => {
-                match (this.ins[1].ty(son).clone(), this.ins[2].ty(son).clone()) {
-                    (Type::I32(lhs), Type::I32(rhs)) =>
-                        Type::I32(if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
-                            I32Type::Const(lhs.wrapping_mul(rhs))
-                        }
-                        else { lhs.meet(rhs) }),
-
-                    _ => Type::Bottom
+            NodeKind::Add => Type::I32({
+                let lhs = this.ins[1].ty(son).as_i32();
+                let rhs = this.ins[2].ty(son).as_i32();
+                if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
+                    I32Type::Const(lhs.wrapping_add(rhs))
                 }
-            },
+                else { lhs.meet(rhs) }
+            }),
+
+            NodeKind::Sub => Type::I32({
+                let lhs = this.ins[1].ty(son).as_i32();
+                let rhs = this.ins[2].ty(son).as_i32();
+                if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
+                    I32Type::Const(lhs.wrapping_sub(rhs))
+                }
+                else { lhs.meet(rhs) }
+            }),
+
+            NodeKind::Mul => Type::I32({
+                let lhs = this.ins[1].ty(son).as_i32();
+                let rhs = this.ins[2].ty(son).as_i32();
+                if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
+                    I32Type::Const(lhs.wrapping_mul(rhs))
+                }
+                else { lhs.meet(rhs) }
+            }),
 
             NodeKind::Div => {
-                match (this.ins[1].ty(son).clone(), this.ins[2].ty(son).clone()) {
-                    (Type::I32(lhs), Type::I32(rhs)) =>
-                        if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
-                            if rhs != 0 { Type::I32(I32Type::Const(lhs.wrapping_mul(rhs))) }
-                            else        { Type::Top }
-                        }
-                        else { Type::I32(lhs.meet(rhs)) },
-
-                    _ => Type::Bottom
+                let lhs = this.ins[1].ty(son).as_i32();
+                let rhs = this.ins[2].ty(son).as_i32();
+                if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
+                    if rhs != 0 { Type::I32(I32Type::Const(lhs.wrapping_mul(rhs))) }
+                    else        { Type::Top }
                 }
+                else { Type::I32(lhs.meet(rhs)) }
             }
         };
 
@@ -679,6 +757,22 @@ impl Son {
         self.new_node(NodeKind::Neg, Type::Bottom, &[self.ctrl, value])
     }
 
+    fn new_not_node(&mut self, value: NodeId) -> NodeId {
+        self.new_node(NodeKind::Not, Type::Bottom, &[self.ctrl, value])
+    }
+
+    fn new_cmp_eq_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
+        self.new_node(NodeKind::CmpEq, Type::Bottom, &[self.ctrl, lhs, rhs])
+    }
+
+    fn new_cmp_le_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
+        self.new_node(NodeKind::CmpLe, Type::Bottom, &[self.ctrl, lhs, rhs])
+    }
+
+    fn new_cmp_lt_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
+        self.new_node(NodeKind::CmpLt, Type::Bottom, &[self.ctrl, lhs, rhs])
+    }
+
     fn new_add_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
         self.new_node(NodeKind::Add, Type::Bottom, &[self.ctrl, lhs, rhs])
     }
@@ -742,6 +836,12 @@ fn main() {
     let mut son = Son::new();
     Parser::parse_file(&mut son, br#"
         return arg + (1 + 2);
+    "#);
+    dbg!(&son.nodes);
+
+    let mut son = Son::new();
+    Parser::parse_file(&mut son, br#"
+        return (2 >= 3) + (7 != 1) * (1 < 2);
     "#);
     dbg!(&son.nodes);
 }
