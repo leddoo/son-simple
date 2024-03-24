@@ -203,6 +203,8 @@ struct Scope<'a> {
 
 impl<'a> Parser<'a> {
     fn parse_file(son: &mut Son, input: &[u8]) {
+        dbg!(core::str::from_utf8(input).unwrap());
+
         let mut this = Parser {
             tok: Tokenizer {
                 reader: Reader::new(input),
@@ -214,6 +216,7 @@ impl<'a> Parser<'a> {
         let start = this.son.new_start_node(&[Type::Control, Type::I32(I32Type::Bottom)][..]).peephole(this.son);
 
         let entry = this.son.new_proj_node(start, 0).peephole(this.son);
+        this.son.start = entry;
         this.son.set_ctrl(entry);
 
         this.locals.push(Scope {
@@ -225,7 +228,7 @@ impl<'a> Parser<'a> {
 
         this.son.clear_ctrl();
         assert_eq!(this.locals.len(), 1);
-        this.locals[0].value.remove_keep_alive(this.son);
+        this.locals[0].value.remove_keep_alive(true, this.son);
     }
 
     fn parse_block(&mut self, end: TokenKind) {
@@ -241,7 +244,7 @@ impl<'a> Parser<'a> {
             self.parse_stmt();
         }
         for i in locals_save..self.locals.len() {
-            self.locals[i].value.remove_keep_alive(self.son);
+            self.locals[i].value.remove_keep_alive(true, self.son);
         }
         self.locals.truncate(locals_save);
     }
@@ -276,7 +279,7 @@ impl<'a> Parser<'a> {
                 let value = self.parse_expr(0);
                 value.keep_alive(self.son);
                 let old_value = core::mem::replace(&mut self.locals[idx].value, value);
-                old_value.remove_keep_alive(self.son);
+                old_value.remove_keep_alive(true, self.son);
                 self.tok.expect(TokenKind::Semicolon);
             }
 
@@ -396,9 +399,21 @@ enum I32Type {
 }
 
 impl Type {
-    #[inline]
     fn is_dead(&self) -> bool {
         matches!(self, Type::Dead)
+    }
+
+    fn as_i32(&self) -> I32Type {
+        let Type::I32(t) = self else { unreachable!() };
+        return *t;
+    }
+
+    fn to_i32(&self) -> I32Type {
+        match self {
+            Type::Top => I32Type::Top,
+            Type::I32(t) => *t,
+            _ => unreachable!()
+        }
     }
 
     fn is_constant(&self) -> bool {
@@ -408,7 +423,7 @@ impl Type {
             Type::Bottom => false,
             Type::Control => false,
             Type::I32(t) => match t {
-                I32Type::Top => true,
+                I32Type::Top => false,
                 I32Type::Const(_) => true,
                 I32Type::Bottom => false,
             },
@@ -416,14 +431,7 @@ impl Type {
         }
     }
 
-    fn as_i32(&self) -> I32Type {
-        match self {
-            Type::Top => I32Type::Top,
-            Type::I32(t) => *t,
-            _ => unreachable!()
-        }
-    }
-
+    /*
     fn meet(&self, other: &Type) -> Type {
         assert!(!self.is_dead());
         assert!(!other.is_dead());
@@ -440,9 +448,14 @@ impl Type {
             _ => Type::Bottom
         }
     }
+    */
 }
 
 impl I32Type {
+    fn is_const(self) -> bool {
+        matches!(self, I32Type::Const(_))
+    }
+
     fn meet(self, other: Self) -> Self {
         if self == other {
             return self;
@@ -496,6 +509,11 @@ impl NodeId {
     }
 
     #[inline]
+    fn ins_mut(self, son: &mut Son) -> &mut [NodeId] {
+        &mut son.nodes[self].ins
+    }
+
+    #[inline]
     fn outs(self, son: &Son) -> &[NodeId] {
         &son.nodes[self].outs
     }
@@ -524,8 +542,8 @@ impl NodeId {
         self
     }
 
-    fn remove_keep_alive(self, son: &mut Son) {
-        if self.remove_out(NodeId::NONE, son) {
+    fn remove_keep_alive(self, kill: bool, son: &mut Son) {
+        if self.remove_out(NodeId::NONE, son) && kill {
             self.kill(son);
         }
     }
@@ -580,6 +598,11 @@ impl NodeId {
         assert!(self.is_dead(son));
     }
 
+    fn swap_12(self, son: &mut Son) {
+        let ins = self.ins_mut(son);
+        (ins[2], ins[1]) = (ins[1], ins[2]);
+    }
+
     fn peephole(self, son: &mut Son) -> NodeId {
         assert!(!self.is_dead(son));
 
@@ -591,8 +614,24 @@ impl NodeId {
             return result;
         }
         else {
-            return self.idealize(son);
+            if let Some(new) = self.idealize(son) {
+                println!("changed {self:?} -> {new:?}");
+                let new = new.peephole(son);
+                return self.kill_if_changed(new, son);
+            }
+            else {
+                return self;
+            }
         }
+    }
+
+    fn kill_if_changed(self, new: NodeId, son: &mut Son) -> NodeId {
+        if self != new && self.is_unused(son) {
+            new.keep_alive(son);
+            self.kill(son);
+            new.remove_keep_alive(false, son);
+        }
+        return new;
     }
 
     fn compute(self, son: &mut Son) -> Type {
@@ -620,7 +659,7 @@ impl NodeId {
             NodeKind::Const => this.ty.clone(),
 
             NodeKind::Neg => Type::I32({
-                let ty = this.ins[1].ty(son).as_i32();
+                let ty = this.ins[1].ty(son).to_i32();
                 if let I32Type::Const(v) = ty {
                     I32Type::Const(v.wrapping_neg())
                 }
@@ -628,7 +667,7 @@ impl NodeId {
             }),
 
             NodeKind::Not => Type::I32({
-                let ty = this.ins[1].ty(son).as_i32();
+                let ty = this.ins[1].ty(son).to_i32();
                 if let I32Type::Const(v) = ty {
                     I32Type::Const(if v == 0 { 1 } else { 0 })
                 }
@@ -638,8 +677,8 @@ impl NodeId {
             NodeKind::CmpEq |
             NodeKind::CmpLe |
             NodeKind::CmpLt => Type::I32({
-                let lhs = this.ins[1].ty(son).as_i32();
-                let rhs = this.ins[2].ty(son).as_i32();
+                let lhs = this.ins[1].ty(son).to_i32();
+                let rhs = this.ins[2].ty(son).to_i32();
                 if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
                     let value = match this.kind {
                         NodeKind::CmpEq => lhs == rhs,
@@ -653,8 +692,8 @@ impl NodeId {
             }),
 
             NodeKind::Add => Type::I32({
-                let lhs = this.ins[1].ty(son).as_i32();
-                let rhs = this.ins[2].ty(son).as_i32();
+                let lhs = this.ins[1].ty(son).to_i32();
+                let rhs = this.ins[2].ty(son).to_i32();
                 if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
                     I32Type::Const(lhs.wrapping_add(rhs))
                 }
@@ -662,8 +701,8 @@ impl NodeId {
             }),
 
             NodeKind::Sub => Type::I32({
-                let lhs = this.ins[1].ty(son).as_i32();
-                let rhs = this.ins[2].ty(son).as_i32();
+                let lhs = this.ins[1].ty(son).to_i32();
+                let rhs = this.ins[2].ty(son).to_i32();
                 if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
                     I32Type::Const(lhs.wrapping_sub(rhs))
                 }
@@ -671,8 +710,8 @@ impl NodeId {
             }),
 
             NodeKind::Mul => Type::I32({
-                let lhs = this.ins[1].ty(son).as_i32();
-                let rhs = this.ins[2].ty(son).as_i32();
+                let lhs = this.ins[1].ty(son).to_i32();
+                let rhs = this.ins[2].ty(son).to_i32();
                 if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
                     I32Type::Const(lhs.wrapping_mul(rhs))
                 }
@@ -680,8 +719,8 @@ impl NodeId {
             }),
 
             NodeKind::Div => {
-                let lhs = this.ins[1].ty(son).as_i32();
-                let rhs = this.ins[2].ty(son).as_i32();
+                let lhs = this.ins[1].ty(son).to_i32();
+                let rhs = this.ins[2].ty(son).to_i32();
                 if let (I32Type::Const(lhs), I32Type::Const(rhs)) = (lhs, rhs) {
                     if rhs != 0 { Type::I32(I32Type::Const(lhs.wrapping_mul(rhs))) }
                     else        { Type::Top }
@@ -694,15 +733,124 @@ impl NodeId {
         return ty;
     }
 
-    fn idealize(self, son: &mut Son) -> NodeId {
+    fn idealize(self, son: &mut Son) -> Option<NodeId> {
         assert!(!self.is_dead(son));
 
-        self
+        let this = &son.nodes[self];
+
+        match this.kind {
+            NodeKind::Dead => unreachable!(),
+            NodeKind::Start => None,
+            NodeKind::Return => None,
+            NodeKind::Proj(_) => None,
+            NodeKind::Const => None,
+
+            NodeKind::Neg => None,
+            NodeKind::Not => None,
+            NodeKind::CmpEq => None,
+            NodeKind::CmpLe => None,
+            NodeKind::CmpLt => None,
+
+            NodeKind::Add => {
+                println!("idealize {self:?}");
+
+                let lhs = self.ins(son)[1];
+                let rhs = self.ins(son)[2];
+
+                // should have been handled by peehole.
+                assert!(!(   lhs.ty(son).as_i32().is_const()
+                          && rhs.ty(son).as_i32().is_const()));
+
+                // add_zero
+                if let I32Type::Const(0) = rhs.ty(son).as_i32() {
+                    println!("add_zero");
+                    return Some(lhs);
+                }
+
+                // add self (SoP).
+                if lhs == rhs {
+                    println!("sop");
+                    let two = son.new_const_node(2).peephole(son);
+                    return Some(son.new_mul_node(lhs, two));
+                }
+
+                // goal: a left-spine set of adds, with constants on the rhs.
+
+                // move non-adds to rhs.
+                if lhs.kind(son) != NodeKind::Add && rhs.kind(son) == NodeKind::Add {
+                    println!("swap non-add right");
+                    self.swap_12(son);
+                    return Some(self);
+                }
+                // possibilities: (add add), (add non), (non, non).
+
+                // handle (add add) by rotating into ((add rhs1) rhs2)
+                if rhs.kind(son) == NodeKind::Add {
+                    println!("reassoc");
+                    assert!(lhs.kind(son) == NodeKind::Add);
+                    let a = rhs.ins(son)[1];
+                    let b = rhs.ins(son)[2];
+
+                    let lhs_a = son.new_add_node(lhs, a).peephole(son);
+                    return Some(son.new_add_node(lhs_a, b));
+                }
+                // possibilities: (add non), (non, non).
+
+                // sort constants to the right, otherwise sort by id.
+                fn should_swap(lhs: NodeId, rhs: NodeId, son: &Son) -> bool {
+                    if rhs.ty(son).is_constant() {
+                        false
+                    }
+                    else if lhs.ty(son).is_constant() {
+                        true
+                    }
+                    else {
+                        rhs > lhs
+                    }
+                }
+
+                // handle (non, non) by sorting the args.
+                if lhs.kind(son) != NodeKind::Add {
+                    if should_swap(lhs, rhs, son) {
+                        println!("sort args");
+                        self.swap_12(son);
+                        return Some(self);
+                    }
+                    return None;
+                }
+                // possibilities: (add non).
+
+                assert!(lhs.kind(son) == NodeKind::Add);
+                let lhs = lhs.ins(son);
+
+                // (x + c1) + c2  ==>> x + (c1 + c2)
+                if lhs[2].ty(son).is_constant() && rhs.ty(son).is_constant() {
+                    println!("group consants");
+                    let x = lhs[1];
+                    let c1c2 = son.new_add_node(lhs[2], rhs).peephole(son);
+                    return Some(son.new_add_node(x, c1c2));
+                }
+
+                // sort rhs.
+                if should_swap(lhs[2], rhs, son) {
+                    println!("sort spine");
+                    self.swap_12(son);
+                    return Some(self);
+                }
+
+                None
+            }
+
+            NodeKind::Sub => None,
+            NodeKind::Mul => None,
+            NodeKind::Div => None,
+        }
     }
 }
 
 struct Son {
     nodes: KVec<NodeId, Node>,
+    start: NodeId,
     ctrl: NodeId
 }
 
@@ -710,6 +858,7 @@ impl Son {
     fn new() -> Self {
         let mut this = Self {
             nodes: KVec::new(),
+            start: NodeId::MAX,
             ctrl: NodeId::MAX,
         };
 
@@ -730,12 +879,12 @@ impl Son {
 
     fn clear_ctrl(&mut self) {
         core::mem::replace(&mut self.ctrl, NodeId::MAX)
-            .remove_keep_alive(self);
+            .remove_keep_alive(true, self);
     }
 
     fn new_node(&mut self, kind: NodeKind, ty: Type, ins: &[NodeId]) -> NodeId {
         for n in ins.copy_it() {
-            assert!(!n.is_dead(self));
+            assert!(n == NodeId::NONE || !n.is_dead(self));
         }
 
         let id = self.nodes.push(Node {
@@ -765,43 +914,43 @@ impl Son {
     }
 
     fn new_const_node(&mut self, value: impl Into<Type>) -> NodeId {
-        self.new_node(NodeKind::Const, value.into(), &[self.ctrl])
+        self.new_node(NodeKind::Const, value.into(), &[self.start])
     }
 
     fn new_neg_node(&mut self, value: NodeId) -> NodeId {
-        self.new_node(NodeKind::Neg, Type::Bottom, &[self.ctrl, value])
+        self.new_node(NodeKind::Neg, Type::Bottom, &[NodeId::NONE, value])
     }
 
     fn new_not_node(&mut self, value: NodeId) -> NodeId {
-        self.new_node(NodeKind::Not, Type::Bottom, &[self.ctrl, value])
+        self.new_node(NodeKind::Not, Type::Bottom, &[NodeId::NONE, value])
     }
 
     fn new_cmp_eq_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::CmpEq, Type::Bottom, &[self.ctrl, lhs, rhs])
+        self.new_node(NodeKind::CmpEq, Type::Bottom, &[NodeId::NONE, lhs, rhs])
     }
 
     fn new_cmp_le_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::CmpLe, Type::Bottom, &[self.ctrl, lhs, rhs])
+        self.new_node(NodeKind::CmpLe, Type::Bottom, &[NodeId::NONE, lhs, rhs])
     }
 
     fn new_cmp_lt_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::CmpLt, Type::Bottom, &[self.ctrl, lhs, rhs])
+        self.new_node(NodeKind::CmpLt, Type::Bottom, &[NodeId::NONE, lhs, rhs])
     }
 
     fn new_add_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Add, Type::Bottom, &[self.ctrl, lhs, rhs])
+        self.new_node(NodeKind::Add, Type::Bottom, &[NodeId::NONE, lhs, rhs])
     }
 
     fn new_sub_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Sub, Type::Bottom, &[self.ctrl, lhs, rhs])
+        self.new_node(NodeKind::Sub, Type::Bottom, &[NodeId::NONE, lhs, rhs])
     }
 
     fn new_mul_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Mul, Type::Bottom, &[self.ctrl, lhs, rhs])
+        self.new_node(NodeKind::Mul, Type::Bottom, &[NodeId::NONE, lhs, rhs])
     }
 
     fn new_div_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Div, Type::Bottom, &[self.ctrl, lhs, rhs])
+        self.new_node(NodeKind::Div, Type::Bottom, &[NodeId::NONE, lhs, rhs])
     }
 }
 
@@ -845,12 +994,6 @@ fn main() {
     let mut son = Son::new();
     Parser::parse_file(&mut son, br#"
         return 1 + arg + 2;
-    "#);
-    dbg!(&son.nodes);
-
-    let mut son = Son::new();
-    Parser::parse_file(&mut son, br#"
-        return arg + (1 + 2);
     "#);
     dbg!(&son.nodes);
 
