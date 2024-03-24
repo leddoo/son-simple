@@ -5,26 +5,33 @@ use sti::keyed::KVec;
 
 
 #[derive(Clone, Copy, Debug)]
-struct Token {
-    kind: TokenKind,
+struct Token<'a> {
+    kind: TokenKind<'a>,
     begin: u32,
     #[allow(dead_code)]
     end: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TokenKind {
+enum TokenKind<'a> {
     Eof,
     Int(i32),
+    Ident(&'a str),
     Semicolon,
     Add,
     Sub,
     Mul,
     Div,
-    Return,
+    Eq,
+    LParen,
+    RParen,
+    LCurly,
+    RCurly,
+    KwReturn,
+    KwVar,
 }
 
-impl TokenKind {
+impl<'a> TokenKind<'a> {
     fn prec_left(self) -> Option<u32> {
         Some(match self {
             TokenKind::Add => 600,
@@ -58,7 +65,7 @@ impl<'a> Tokenizer<'a> {
         self.reader.consume_while(u8::is_ascii_whitespace);
     }
 
-    fn next(&mut self) -> Token {
+    fn next(&mut self) -> Token<'a> {
         self.skip_ws();
 
         let begin = self.reader.offset();
@@ -81,8 +88,9 @@ impl<'a> Tokenizer<'a> {
                     at.is_ascii_alphanumeric() || *at == b'_').0;
                 let str = core::str::from_utf8(bytes).unwrap();
                 match str {
-                    "return" => TokenKind::Return,
-                    _ => todo!()
+                    "return" => TokenKind::KwReturn,
+                    "var" => TokenKind::KwVar,
+                    _ => TokenKind::Ident(str),
                 }
             }
 
@@ -90,6 +98,13 @@ impl<'a> Tokenizer<'a> {
             b'-' => TokenKind::Sub,
             b'*' => TokenKind::Mul,
             b'/' => TokenKind::Div,
+
+            b'=' => TokenKind::Eq,
+
+            b'(' => TokenKind::LParen,
+            b')' => TokenKind::RParen,
+            b'{' => TokenKind::LCurly,
+            b'}' => TokenKind::RCurly,
 
             b';' => TokenKind::Semicolon,
 
@@ -112,6 +127,14 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
+    fn expect_ident(&mut self) -> &'a str {
+        let at = self.next();
+        let TokenKind::Ident(result) = at.kind else {
+            panic!("syntax error: expected \"identifier\" at {}", at.begin);
+        };
+        return result;
+    }
+
     fn save(&self) -> usize {
         return self.reader.offset();
     }
@@ -124,6 +147,13 @@ impl<'a> Tokenizer<'a> {
 struct Parser<'a> {
     tok: Tokenizer<'a>,
     son: &'a mut Son,
+    locals: Vec<Scope<'a>>,
+}
+
+#[derive(Debug)]
+struct Scope<'a> {
+    name: &'a str,
+    value: NodeId,
 }
 
 impl<'a> Parser<'a> {
@@ -133,15 +163,71 @@ impl<'a> Parser<'a> {
                 reader: Reader::new(input),
             },
             son,
+            locals: Vec::new(),
         };
 
         let start = this.son.new_start_node();
         this.son.set_start(start);
 
-        this.tok.expect(TokenKind::Return);
-        let value = this.parse_expr(0);
-        this.tok.expect(TokenKind::Semicolon);
-        this.son.new_return_node(start, value).peephole(this.son);
+        this.parse_block(TokenKind::Eof);
+    }
+
+    fn parse_block(&mut self, end: TokenKind) {
+        let locals_save = self.locals.len();
+        loop {
+            let save = self.tok.save();
+            let at = self.tok.next();
+            if at.kind == end {
+                break;
+            }
+            self.tok.restore(save);
+
+            self.parse_stmt();
+        }
+        for i in locals_save..self.locals.len() {
+            self.locals[i].value.remove_keep_alive(self.son);
+        }
+        self.locals.truncate(locals_save);
+    }
+
+    fn parse_stmt(&mut self) {
+        let at = self.tok.next();
+        match at.kind {
+            TokenKind::Semicolon => (),
+
+            TokenKind::KwVar => {
+                let name = self.tok.expect_ident();
+                self.tok.expect(TokenKind::Eq);
+                let value = self.parse_expr(0);
+                value.keep_alive(self.son);
+                self.locals.push(Scope { name, value });
+                self.tok.expect(TokenKind::Semicolon);
+            }
+
+            TokenKind::KwReturn => {
+                let value = self.parse_expr(0);
+                self.son.new_return_node(self.son.start, value);
+                self.tok.expect(TokenKind::Semicolon);
+            }
+
+            TokenKind::LCurly => {
+                self.parse_block(TokenKind::RCurly);
+            }
+
+            TokenKind::Ident(name) => {
+                let idx = self.local(name);
+                self.tok.expect(TokenKind::Eq);
+                let value = self.parse_expr(0);
+                value.keep_alive(self.son);
+                let old_value = core::mem::replace(&mut self.locals[idx].value, value);
+                old_value.remove_keep_alive(self.son);
+                self.tok.expect(TokenKind::Semicolon);
+            }
+
+            _ => {
+                panic!("syntax error: unexpected {:?} at {} while parsing statement", at.kind, at.begin);
+            }
+        }
     }
 
     fn parse_expr(&mut self, prec: u32) -> NodeId {
@@ -178,10 +264,31 @@ impl<'a> Parser<'a> {
                 self.son.new_neg_node(v).peephole(self.son)
             }
 
+            TokenKind::Ident(name) => {
+                let idx = self.local(name);
+                self.locals[idx].value
+            }
+
+            TokenKind::LParen => {
+                let result = self.parse_expr(0);
+                self.tok.expect(TokenKind::RParen);
+                result
+            }
+
             _ => {
-                panic!("syntax error: unexpected {:?} at {}", at.kind, at.begin);
+                panic!("syntax error: unexpected {:?} at {} while parsing expression", at.kind, at.begin);
             }
         }
+    }
+
+    fn local(&self, name: &str) -> usize {
+        for i in (0..self.locals.len()).rev() {
+            let local = &self.locals[i];
+            if local.name == name {
+                return i;
+            }
+        }
+        panic!("error: unknown local {:?}", name);
     }
 }
 
@@ -204,12 +311,19 @@ struct Node {
     outs: Vec<NodeId>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug)]
 enum Type {
     Dead,
     Bottom,
     Top,
     I32(i32),
+}
+
+impl Type {
+    #[inline]
+    fn is_dead(self) -> bool {
+        matches!(self, Type::Dead)
+    }
 }
 
 impl From<i32> for Type {
@@ -271,14 +385,24 @@ impl NodeId {
     #[inline]
     fn is_dead(self, son: &Son) -> bool {
         if self.kind(son) == NodeKind::Dead {
-            assert!(self.ty(son) == Type::Dead);
+            assert!(self.ty(son).is_dead());
             assert!(self.ins(son).is_empty());
             assert!(self.outs(son).is_empty());
             true
         }
         else {
-            assert!(self.ty(son) != Type::Dead);
+            assert!(!self.ty(son).is_dead());
             false
+        }
+    }
+
+    fn keep_alive(self, son: &mut Son) {
+        self.add_out(NodeId::NONE, son);
+    }
+
+    fn remove_keep_alive(self, son: &mut Son) {
+        if self.remove_out(NodeId::NONE, son) {
+            self.kill(son);
         }
     }
 
@@ -432,7 +556,7 @@ impl Son {
 
         let none = this.nodes.push(Node {
             kind: NodeKind::Dead,
-            ty: Type::Bottom,
+            ty: Type::Dead,
             ins: Vec::new(),
             outs: Vec::new(),
         });
@@ -446,6 +570,10 @@ impl Son {
     }
 
     fn new_node(&mut self, kind: NodeKind, ty: Type, ins: &[NodeId]) -> NodeId {
+        for n in ins.copy_it() {
+            assert!(!n.is_dead(self));
+        }
+
         let id = self.nodes.push(Node {
             kind,
             ty,
@@ -504,6 +632,29 @@ fn main() {
     let mut son = Son::new();
     Parser::parse_file(&mut son, br#"
         return 1 + 2 * 3 + -5;
+    "#);
+    dbg!(&son.nodes);
+
+    let mut son = Son::new();
+    Parser::parse_file(&mut son, br#"
+        var a=1;
+        var b=2;
+        var c=0;
+        {
+          var b=3;
+          c=a+b;
+        }
+        return c;
+    "#);
+    dbg!(&son.nodes);
+
+    let mut son = Son::new();
+    Parser::parse_file(&mut son, br#"
+        var x0=1;
+        var y0=2;
+        var x1=3;
+        var y1=4;
+        return (x0-x1)*(x0-x1) + (y0-y1)*(y0-y1);
     "#);
     dbg!(&son.nodes);
 }
