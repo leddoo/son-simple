@@ -8,6 +8,7 @@ use sti::keyed::KVec;
 struct Token {
     kind: TokenKind,
     begin: u32,
+    #[allow(dead_code)]
     end: u32,
 }
 
@@ -140,7 +141,7 @@ impl<'a> Parser<'a> {
         this.tok.expect(TokenKind::Return);
         let value = this.parse_expr(0);
         this.tok.expect(TokenKind::Semicolon);
-        this.son.new_return_node(start, value);
+        this.son.new_return_node(start, value).peephole(this.son);
     }
 
     fn parse_expr(&mut self, prec: u32) -> NodeId {
@@ -148,20 +149,20 @@ impl<'a> Parser<'a> {
         loop {
             let save = self.tok.save();
             let at = self.tok.next();
-            let at_prec = at.kind.prec_left();
             if at.kind.prec_left().filter(|p| *p >= prec).is_none() {
                 self.tok.restore(save);
                 return result;
             }
 
             let rhs = self.parse_expr(at.kind.prec_right());
+
             result = match at.kind {
                 TokenKind::Add => self.son.new_add_node(result, rhs),
                 TokenKind::Sub => self.son.new_sub_node(result, rhs),
                 TokenKind::Mul => self.son.new_mul_node(result, rhs),
                 TokenKind::Div => self.son.new_div_node(result, rhs),
                 _ => unreachable!()
-            };
+            }.peephole(self.son);
         }
     }
 
@@ -169,12 +170,12 @@ impl<'a> Parser<'a> {
         let at = self.tok.next();
         match at.kind {
             TokenKind::Int(v) => {
-                self.son.new_const_node(v)
+                self.son.new_const_node(v).peephole(self.son)
             }
 
             TokenKind::Sub => {
                 let v = self.parse_expr(PREC_PREFIX);
-                self.son.new_neg_node(v)
+                self.son.new_neg_node(v).peephole(self.son)
             }
 
             _ => {
@@ -185,25 +186,236 @@ impl<'a> Parser<'a> {
 }
 
 
-sti::define_key!(u32, NodeId, opt: OptNodeId);
+sti::define_key!(u32, NodeId);
+
+impl NodeId {
+    const NONE: NodeId = NodeId(0);
+
+    fn is_none(self) -> bool {
+        self == Self::NONE
+    }
+}
 
 #[derive(Debug)]
 struct Node {
     kind: NodeKind,
+    ty: Type,
     ins: Vec<NodeId>,
     outs: Vec<NodeId>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Type {
+    Dead,
+    Bottom,
+    Top,
+    I32(i32),
+}
+
+impl From<i32> for Type {
+    fn from(value: i32) -> Self {
+        Self::I32(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NodeKind {
+    Dead,
     Start,
     Return,
-    Const(i32),
+    Const,
     Neg,
     Add,
     Sub,
     Mul,
     Div,
+}
+
+impl Type {
+    fn is_constant(self) -> bool {
+        match self {
+            Type::Dead => unreachable!(),
+            Type::Bottom => false,
+            Type::Top => true,
+            Type::I32(_) => true,
+        }
+    }
+}
+
+impl NodeId {
+    #[inline]
+    fn kind(self, son: &Son) -> NodeKind {
+        son.nodes[self].kind
+    }
+
+    #[inline]
+    fn ty(self, son: &Son) -> Type {
+        son.nodes[self].ty
+    }
+
+    #[inline]
+    fn ins(self, son: &Son) -> &[NodeId] {
+        &son.nodes[self].ins
+    }
+
+    #[inline]
+    fn outs(self, son: &Son) -> &[NodeId] {
+        &son.nodes[self].outs
+    }
+
+    #[inline]
+    fn is_unused(self, son: &Son) -> bool {
+        self.outs(son).is_empty()
+    }
+
+    #[inline]
+    fn is_dead(self, son: &Son) -> bool {
+        if self.kind(son) == NodeKind::Dead {
+            assert!(self.ty(son) == Type::Dead);
+            assert!(self.ins(son).is_empty());
+            assert!(self.outs(son).is_empty());
+            true
+        }
+        else {
+            assert!(self.ty(son) != Type::Dead);
+            false
+        }
+    }
+
+    fn set_in(self, i: usize, new_in: NodeId, son: &mut Son) {
+        assert!(!self.is_dead(son));
+
+        let old_in = self.ins(son)[i];
+        if new_in == old_in {
+            return;
+        }
+
+        if !new_in.is_none() {
+            new_in.add_out(self, son);
+        }
+
+        if !old_in.is_none() && old_in.remove_out(self, son) {
+            old_in.kill(son);
+        }
+
+        let this = &mut son.nodes[self];
+        this.ins[i] = new_in;
+    }
+
+    fn add_out(self, new_out: NodeId, son: &mut Son) {
+        assert!(!self.is_dead(son));
+        let this = &mut son.nodes[self];
+        this.outs.push(new_out);
+    }
+
+    fn remove_out(self, old_out: NodeId, son: &mut Son) -> bool {
+        assert!(!self.is_dead(son));
+        let this = &mut son.nodes[self];
+        let index = this.outs.iter().position(|o| *o == old_out)
+            .expect("error: {old_out:?} is not in {self:?}'s outs");
+        this.outs.remove_swap(index);
+        return this.outs.is_empty();
+    }
+
+    fn kill(self, son: &mut Son) {
+        assert!(!self.is_dead(son));
+        assert!(self.is_unused(son));
+
+        for i in 0..self.ins(son).len() {
+            self.set_in(i, NodeId::NONE, son);
+        }
+        let this = &mut son.nodes[self];
+        this.kind = NodeKind::Dead;
+        this.ty = Type::Dead;
+        this.ins.clear();
+
+        assert!(self.is_dead(son));
+    }
+
+    fn peephole(self, son: &mut Son) -> NodeId {
+        assert!(!self.is_dead(son));
+
+        let ty = self.compute(son);
+
+        if ty.is_constant() && self.kind(son) != NodeKind::Const {
+            let result = son.new_const_node(ty);
+            self.kill(son);
+            return result;
+        }
+        else {
+            return self.idealize(son);
+        }
+    }
+
+    fn compute(self, son: &mut Son) -> Type {
+        assert!(!self.is_dead(son));
+
+        let this = &son.nodes[self];
+
+        let ty = match this.kind {
+            NodeKind::Dead => unreachable!(),
+
+            NodeKind::Start => Type::Bottom,
+
+            NodeKind::Return => Type::Bottom,
+
+            NodeKind::Const => this.ty,
+
+            NodeKind::Neg => {
+                let arg = &son.nodes[this.ins[1]];
+                if let Type::I32(v) = arg.ty {
+                    Type::I32(-v)
+                }
+                else { Type::Bottom }
+            }
+
+            NodeKind::Add => {
+                match (this.ins[1].ty(son), this.ins[2].ty(son)) {
+                    (Type::I32(lhs), Type::I32(rhs)) =>
+                        Type::I32(lhs.wrapping_add(rhs)),
+
+                    _ => Type::Bottom
+                }
+            }
+
+            NodeKind::Sub => {
+                match (this.ins[1].ty(son), this.ins[2].ty(son)) {
+                    (Type::I32(lhs), Type::I32(rhs)) =>
+                        Type::I32(lhs.wrapping_sub(rhs)),
+
+                    _ => Type::Bottom
+                }
+            },
+
+            NodeKind::Mul => {
+                match (this.ins[1].ty(son), this.ins[2].ty(son)) {
+                    (Type::I32(lhs), Type::I32(rhs)) =>
+                        Type::I32(lhs.wrapping_mul(rhs)),
+
+                    _ => Type::Bottom
+                }
+            },
+
+            NodeKind::Div => {
+                match (this.ins[1].ty(son), this.ins[2].ty(son)) {
+                    (Type::I32(lhs), Type::I32(rhs)) =>
+                        if rhs != 0 { Type::I32(lhs.wrapping_mul(rhs)) }
+                        else        { Type::Top },
+
+                    _ => Type::Bottom
+                }
+            }
+        };
+
+        son.nodes[self].ty = ty;
+        return ty;
+    }
+
+    fn idealize(self, son: &mut Son) -> NodeId {
+        assert!(!self.is_dead(son));
+
+        self
+    }
 }
 
 struct Son {
@@ -213,19 +425,30 @@ struct Son {
 
 impl Son {
     fn new() -> Self {
-        Self {
+        let mut this = Self {
             nodes: KVec::new(),
             start: NodeId::MAX,
-        }
+        };
+
+        let none = this.nodes.push(Node {
+            kind: NodeKind::Dead,
+            ty: Type::Bottom,
+            ins: Vec::new(),
+            outs: Vec::new(),
+        });
+        assert_eq!(none, NodeId::NONE);
+
+        return this;
     }
 
     fn set_start(&mut self, id: NodeId) {
         self.start = id;
     }
 
-    fn new_node(&mut self, kind: NodeKind, ins: &[NodeId]) -> NodeId {
+    fn new_node(&mut self, kind: NodeKind, ty: Type, ins: &[NodeId]) -> NodeId {
         let id = self.nodes.push(Node {
             kind,
+            ty,
             ins: ins.into(),
             outs: Vec::new(),
         });
@@ -238,47 +461,47 @@ impl Son {
     }
 
     fn new_start_node(&mut self) -> NodeId {
-        self.new_node(NodeKind::Start, &[])
+        self.new_node(NodeKind::Start, Type::Bottom, &[])
     }
 
     fn new_return_node(&mut self, ctrl: NodeId, value: NodeId) -> NodeId {
-        self.new_node(NodeKind::Return, &[ctrl, value])
+        self.new_node(NodeKind::Return, Type::Bottom, &[ctrl, value])
     }
 
-    fn new_const_node(&mut self, value: i32) -> NodeId {
-        self.new_node(NodeKind::Const(value), &[self.start])
+    fn new_const_node(&mut self, value: impl Into<Type>) -> NodeId {
+        self.new_node(NodeKind::Const, value.into(), &[self.start])
     }
 
     fn new_neg_node(&mut self, value: NodeId) -> NodeId {
-        self.new_node(NodeKind::Neg, &[self.start, value])
+        self.new_node(NodeKind::Neg, Type::Bottom, &[self.start, value])
     }
 
     fn new_add_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Add, &[self.start, lhs, rhs])
+        self.new_node(NodeKind::Add, Type::Bottom, &[self.start, lhs, rhs])
     }
 
     fn new_sub_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Sub, &[self.start, lhs, rhs])
+        self.new_node(NodeKind::Sub, Type::Bottom, &[self.start, lhs, rhs])
     }
 
     fn new_mul_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Mul, &[self.start, lhs, rhs])
+        self.new_node(NodeKind::Mul, Type::Bottom, &[self.start, lhs, rhs])
     }
 
     fn new_div_node(&mut self, lhs: NodeId, rhs: NodeId) -> NodeId {
-        self.new_node(NodeKind::Div, &[self.start, lhs, rhs])
+        self.new_node(NodeKind::Div, Type::Bottom, &[self.start, lhs, rhs])
     }
 }
 
 
 fn main() {
     let mut son = Son::new();
-
     Parser::parse_file(&mut son, br#"
         return 1;
     "#);
     dbg!(&son.nodes);
 
+    let mut son = Son::new();
     Parser::parse_file(&mut son, br#"
         return 1 + 2 * 3 + -5;
     "#);
